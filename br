@@ -1,0 +1,300 @@
+#!/usr/bin/env python2
+
+import subprocess
+import ConfigParser as configparser
+import shutil
+import os.path
+import os
+import sys
+import re
+
+import click
+
+
+BROMINE_DIR = None
+PROJECT_DIR = None
+BRANCHES_DIR = None
+
+
+VERBOSE = False
+
+def trace(fmt, *args, **kwargs):
+    '''Simplifies echoing only on the verbose flag'''
+    if VERBOSE:
+        click.echo(fmt.format(*args, **kwargs), **kwargs)
+
+def echo(fmt, *args, **kwargs):
+    click.echo(fmt.format(*args, **kwargs), **kwargs)
+
+class Options(object):
+    def __init__(self):
+        self.start_cmd = None
+        self.end_cmd = None
+        self.restart_cmd = None
+
+O = Options()
+
+def update_currently_linked_file(branchname=''):
+    '''Write the given branch name to the checkout file'''
+    with open(os.path.join(BROMINE_DIR, 'currently_linked'), 'w') as cl:
+        cl.write(branchname)
+
+def get_currently_linked():
+    '''Return the branch that's currently linked into the project
+    directory. Will be an empty string if nothing is linked'''
+    with open(os.path.join(BROMINE_DIR, 'currently_linked'), 'r') as cl:
+        return cl.read()
+
+def assert_bromine_dir(config_dir):
+    '''Ensures the bromine directory is set up and has the right
+    structure'''
+    global BROMINE_DIR, PROJECT_DIR, BRANCHES_DIR
+    BROMINE_DIR = config_dir
+    PROJECT_DIR = os.path.dirname(BROMINE_DIR)
+    BRANCHES_DIR = os.path.join(BROMINE_DIR, 'branches')
+    trace("Bromine dir: {}", BROMINE_DIR)
+    trace("Project dir: {}", PROJECT_DIR)
+    trace("Branches dir: {}", BRANCHES_DIR)
+    if not os.path.exists(config_dir):
+        trace("Creating {}", BROMINE_DIR)
+        os.mkdir(BROMINE_DIR)
+
+        conf_file = os.path.join(BROMINE_DIR, 'brominerc')
+        trace("Creating {}", conf_file)
+        with open(conf_file, 'w') as f:
+            f.write('[server]\n'
+                    'start_cmd=\n'
+                    'stop_cmd=\n'
+                    '# defaults to start_cmd then stop_cmd\n'
+                    'restart_cmd=\n')
+
+        trace("Creating {}", BRANCHES_DIR)
+        os.mkdir(BRANCHES_DIR)
+
+
+def find_config_dir():
+    '''Search up the filesystem for the location that the .bromine
+    directory is or should be. If it finds a .git directory, it will
+    create a .bromine directory next to it'''
+    path = os.getcwd()
+    while path:
+        for subdir in ('.bromine', '.git'):
+            prospective = os.path.join(path, subdir)
+            trace("Checking for {}...", prospective, nl=False)
+            if os.path.isdir(prospective):
+                trace("  found!")
+                config_dir = os.path.join(path, '.bromine')
+                assert_bromine_dir(config_dir)
+                return config_dir
+            else:
+                trace("  not found.")
+        path = path.rsplit('/', 1)[0]
+
+def load_config():
+    global O
+    find_config_dir() # sets BROMINE_DIR
+    trace("Reading config file {}", BROMINE_DIR+'/brominerc')
+    conf = configparser.SafeConfigParser()
+    conf.read(os.path.join(BROMINE_DIR, 'brominerc'))
+    if conf.has_option('server', 'start_cmd'):
+        O.start_cmd = conf.get('server', 'start_cmd')
+        trace("Start command set to: {}", O.start_cmd)
+    if conf.has_option('server', 'stop_cmd'):
+        O.stop_cmd = conf.get('server', 'stop_cmd')
+        trace("Stop command set to: {}", O.stop_cmd)
+    if conf.has_option('server', 'restart_cmd'):
+        O.restart_cmd = conf.get('server', 'restart_cmd')
+        trace("Restart command set to: {}", O.restart_cmd)
+
+@click.group()
+@click.option('--verbose', '-v', is_flag=True, default=False, help='Verbose output')
+def main(verbose):
+    '''Manage non-source code materials when switching branches'''
+    global VERBOSE
+    VERBOSE = verbose
+    load_config()
+
+
+@main.command()
+def switch():
+    depart, arrive = get_last_checkout(PROJECT_DIR)
+    echo("From {} to {}", depart, arrive)
+    git_ancestry = git_ancestor_compare(depart, arrive)
+    echo("{} is {} to {} in git", depart, git_ancestry, arrive)
+    semantic_ancestry = semantic_ancestor_compare(depart, arrive)
+    echo("{} is {} to {} semantically", depart, semantic_ancestry, arrive)
+
+@main.command()
+@click.option('--name', default="<invalid>", help="Name to stash under")
+@click.option('--dry-run', '-d', is_flag=True,
+               help="Don't do anything, just report what would be done")
+def stash(name, dry_run):
+    '''Move git untracked files into bromine storage'''
+    if name is "<invalid>":
+        name = get_current_branch()
+    trace("Stashing to {}", name)
+    branch_path = branch_dir(name)
+    if not os.path.exists(branch_path):
+        os.mkdir(branch_path)
+
+    removable = re.compile(r'Would remove (.*)')
+    git_clean_report = subprocess.Popen(
+        ['git', 'clean', '--dry-run', '-x', '-d'],
+        cwd=PROJECT_DIR,
+        stdout=subprocess.PIPE,
+    )
+    to_remove = []
+    for line in git_clean_report.stdout.readlines():
+        filename = removable.search(line).groups()[0]
+        if filename and filename != '.bromine/':
+            to_remove.append(filename)
+
+    current_dir = os.getcwd()
+    operation = "Would stash" if dry_run else "stashing"
+    for filename in to_remove:
+        original_file = os.path.relpath(
+            os.path.join(PROJECT_DIR, filename), current_dir)
+        assimilated_file = os.path.join(
+            os.path.relpath(branch_path, current_dir), filename)
+        if dry_run or VERBOSE:
+            echo("{} {}", operation, original_file)
+        if not dry_run:
+            # renames will create missing intermediate directories
+            os.renames(original_file, assimilated_file)
+
+@main.command()
+@click.argument('name', default=None)
+def unstash(name):
+    '''Move bromine stored files back to the project directory'''
+    name = get_current_branch()
+
+
+def dir_size(path):
+    '''Returns a human readable string of the total size of a directory'''
+    du_output = subprocess.check_output(
+        ['du', '--summarize', '--human-readable', path])
+    return re.search(r'^(\w+)\t', du_output).groups()[0]
+
+def branch_dir(branchname):
+    '''Returns the branch directory name for the given branch'''
+    return os.path.join(BRANCHES_DIR, branchname)
+
+@main.command('list')
+@click.option('--size', '-s', is_flag=True, default=False,
+              help="List size of stored files")
+def list_cmd(size):
+    '''List the branches managed by bromine'''
+    str_size = ''
+    for branch in os.listdir(BRANCHES_DIR):
+        if size:
+            str_size = dir_size(os.path.join(BRANCHES_DIR, branch))
+        echo("{}\t{}", branch, str_size)
+
+@main.command()
+@click.argument('branch')
+@click.option('--force', is_flag=True, default=False,
+              help="Don't interact, just delete the directory")
+def delete(branch, force):
+    '''Delete stored files for a branch'''
+    branch_path = branch_dir(branch)
+    if not os.path.isdir(branch_path):
+        echo("{} is not currently tracked by bromine.", branch)
+        return
+    size = dir_size(branch_path)
+    click.confirm("Are you sure you want to delete all bromine data for {}?\n"
+                  "It currently has a size of {}".format(branch, size))
+
+def get_current_branch():
+    '''Finds the current git branch in the project directory'''
+    branch = subprocess.Popen(
+        ['git', 'symbolic-ref', '--quiet', '--short', 'HEAD'],
+        cwd=PROJECT_DIR,
+        stdout=subprocess.PIPE,
+    )
+    return branch.stdout.read().strip()
+
+def get_last_checkout(project_dir):
+    "Scans the reflog looking for a line that looks like a branch switch"
+    reflog = subprocess.Popen(
+        ['git', 'reflog'],
+        cwd=PROJECT_DIR,
+        stdout=subprocess.PIPE,
+    )
+    checkout = re.compile(r'checkout: moving from (.*) to (.*)')
+    for line in reflog.stdout:
+        checkout_match = checkout.search(line)
+        if checkout_match:
+            depart, arrive = checkout_match.groups()
+            if depart == arrive:
+                continue # not interesting, moved to the same branch
+            reflog.terminate()
+            return depart, arrive
+    else:
+        echo("Could not find a checkout line in the reflog!", err=True)
+        exit(1)
+
+def git_ancestor_compare(A, B):
+    '''Determines if the the departure branch is a descendent of the
+    arrival branch.'''
+    def is_ancestor(a, b):
+        return subprocess.Popen(
+            ['git', 'merge-base', '--is-ancestor', A, B],
+            cwd=PROJECT_DIR,
+        ).wait() == 0
+
+    if is_ancestor(A, B):
+        return "ancestor"
+    elif is_ancestor(B, A):
+        return "descendent"
+    else:
+        return "incomparable"
+
+def semantic_ancestor_compare(A, B):
+    '''Semantic ancestry is based on version comparison.'''
+    version_re = re.compile(r'v(\d+).(\d+).(\d+|x)')
+    search_a = version_re.search(A)
+    search_b = version_re.search(B)
+    if not search_b or not search_a:
+        return "incomparable"
+    major_a, minor_a, patch_a = search_a.groups()
+    major_b, minor_b, patch_b = search_b.groups()
+    if major_a < major_b:
+        return "ancestor"
+    elif major_a > major_b:
+        return "descendent"
+    elif minor_a < minor_b:
+        return "ancestor"
+    elif minor_a > minor_b:
+        return "descendent"
+    elif 'x' in (patch_a, patch_b):
+        return "ancestor"
+    else:
+        # maybe later let the user define patch ancestry
+        return "ancestor"
+
+@main.command()
+@click.argument('branch')
+def switch(branch):
+    '''Switch git branches, notifying bromine'''
+    depart = get_current_branch()
+    arrive = branch
+    echo("Going from {} to {}", depart, arrive)
+
+
+if __name__ == '__main__':
+    '''Commands I'd like:
+    br new (create a new config for a branch)
+      - have the option to link it to a github issue
+      - have the option to create it from an existing project
+    br tree
+    br delete (delete a bromine config for a branch)
+    br close (like delete but just archives it, closing the github issue associated)
+    br switch (switch configurations, branches, build and reboot the server)
+    br unhook (unstow all files)
+    br sync (sync up bromine with the current git branch)
+    br server reboot (restart the server for a branch)
+    br server stop (stop the server)
+    br server start (start the server)
+    br scale +2 (add two servers to the cluster)
+    '''
+    main()
