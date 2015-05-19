@@ -130,7 +130,7 @@ def switch():
                help="Don't do anything, just report what would be done")
 def stash(name, dry_run):
     '''Move git untracked files into bromine storage'''
-    if name is "<invalid>":
+    if name == "<invalid>":
         name = get_current_branch()
     trace("Stashing to {}", name)
     branch_path = branch_dir(name)
@@ -147,7 +147,7 @@ def stash(name, dry_run):
     for line in git_clean_report.stdout.readlines():
         filename = removable.search(line).groups()[0]
         if filename and filename != '.bromine/':
-            to_remove.append(filename)
+            to_remove.append(filename.rstrip('/'))
 
     current_dir = os.getcwd()
     operation = "Would stash" if dry_run else "stashing"
