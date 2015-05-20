@@ -173,7 +173,7 @@ def stash(name, dry_run, clobber):
               help="Clobber existing files in the project directory "
               "when unstashing")
 def unstash(name, dry_run, clobber):
-    '''Move bromine stored files back to the project directory'''
+    '''Move stashed files back to the project dir'''
     if name is INVALID_NAME:
         name = get_current_branch()
     branch_path = branch_dir(name)
@@ -281,6 +281,31 @@ def delete(branch, force):
     click.confirm("Are you sure you want to delete all stashed files for {}?\n"
                   "It currently has a size of {}".format(branch, size))
 
+@main.group()
+def server():
+    '''Server commands'''
+
+@server.command()
+def start():
+    '''Start the server'''
+    echo("Starting the server...")
+    trace("executing {}", O.start_cmd)
+    subprocess.call(O.start_cmd, shell=True)
+
+@server.command()
+def stop():
+    '''Stop the server'''
+    echo("Stopping the server...")
+    trace("executing {}", O.stop_cmd)
+    subprocess.call(O.stop_cmd, shell=True)
+
+@server.command()
+def restart():
+    '''Restart the server'''
+    echo("Restarting the server...")
+    trace("executing {}", O.restart_cmd)
+    subprocess.call(O.restart_cmd, shell=True)
+
 def get_current_branch():
     '''Finds the current git branch in the project directory'''
     branch = subprocess.Popen(
@@ -348,14 +373,6 @@ def semantic_ancestor_compare(A, B):
     else:
         # maybe later let the user define patch ancestry
         return "ancestor"
-
-@main.command()
-@click.argument('branch')
-def switch(branch):
-    '''Switch git branches, notifying bromine'''
-    depart = get_current_branch()
-    arrive = branch
-    echo("Going from {} to {}", depart, arrive)
 
 
 if __name__ == '__main__':
