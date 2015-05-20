@@ -7,6 +7,7 @@ import os.path
 import os
 import sys
 import re
+import functools
 
 import click
 
@@ -17,6 +18,8 @@ BRANCHES_DIR = None
 
 
 VERBOSE = False
+
+INVALID_NAME = type('Invalid', (object,), {})()
 
 def trace(fmt, *args, **kwargs):
     '''Simplifies echoing only on the verbose flag'''
@@ -125,17 +128,22 @@ def switch():
     echo("{} is {} to {} semantically", depart, semantic_ancestry, arrive)
 
 @main.command()
-@click.option('--name', default="<invalid>", help="Name to stash under")
+@click.option('--name', default=INVALID_NAME, help="Name to stash under")
 @click.option('--dry-run', '-d', is_flag=True,
-               help="Don't do anything, just report what would be done")
-def stash(name, dry_run):
+              help="Don't do anything, just report what would be done")
+@click.option('--clobber', is_flag=True,
+              help="Overwrite existing stashed files")
+def stash(name, dry_run, clobber):
     '''Move git untracked files into bromine storage'''
-    if name == "<invalid>":
+    if name is INVALID_NAME:
         name = get_current_branch()
     trace("Stashing to {}", name)
     branch_path = branch_dir(name)
     if not os.path.exists(branch_path):
         os.mkdir(branch_path)
+    else:
+        # todo: prompt if they want to override it
+        pass
 
     removable = re.compile(r'Would remove (.*)')
     git_clean_report = subprocess.Popen(
@@ -143,37 +151,106 @@ def stash(name, dry_run):
         cwd=PROJECT_DIR,
         stdout=subprocess.PIPE,
     )
-    to_remove = []
+    current_dir = os.getcwd()
+    to_move = []
     for line in git_clean_report.stdout.readlines():
         filename = removable.search(line).groups()[0]
         if filename and filename != '.bromine/':
-            to_remove.append(filename.rstrip('/'))
-
-    current_dir = os.getcwd()
-    operation = "Would stash" if dry_run else "stashing"
-    for filename in to_remove:
-        original_file = os.path.relpath(
-            os.path.join(PROJECT_DIR, filename), current_dir)
-        assimilated_file = os.path.join(
-            os.path.relpath(branch_path, current_dir), filename)
-        if dry_run or VERBOSE:
-            echo("{} {}", operation, original_file)
-        if not dry_run:
-            # renames will create missing intermediate directories
-            os.renames(original_file, assimilated_file)
+            to_move.append(both_paths(branch_path, current_dir, filename.rstrip('/')))
+    if not to_move:
+        echo("Nothing to stash for branch {}", name)
+        return
+    for project_file, bromine_file in to_move:
+        if not move_merge(project_file, bromine_file, clobber, dry_run):
+            exit(1)
 
 @main.command()
-@click.argument('name', default=None)
-def unstash(name):
+@click.argument('name', default=INVALID_NAME)
+@click.option('--dry-run', '-d', is_flag=True,
+              help="Don't actually unstash anything, "
+              "just report what would have been done")
+@click.option('--clobber', is_flag=True,
+              help="Clobber existing files in the project directory "
+              "when unstashing")
+def unstash(name, dry_run, clobber):
     '''Move bromine stored files back to the project directory'''
-    name = get_current_branch()
+    if name is INVALID_NAME:
+        name = get_current_branch()
+    branch_path = branch_dir(name)
+    trace("Unstashing from {}", branch_path)
+    if not os.path.exists(branch_path):
+        echo("Nothing to unstash for branch {}", name)
+        return
+    get_paths = functools.partial(both_paths, branch_path, os.getcwd())
+    to_replace = [get_paths(filename) for filename in os.listdir(branch_path)]
+    for project_file, bromine_file in to_replace:
+        if not move_merge(bromine_file, project_file, clobber, dry_run):
+            exit(1)
+
+def move_merge(source, dest, clobber=False, dry_run=False):
+    '''Moves a list of files to their destination. The filenames need
+    to be in either absolute format or relative to the current working
+    directory because this method calls os.listdir recursively if
+    necessary'''
+    source_type, dest_type = path_type(source), path_type(dest)
+    if source_type == 'dir' and dest_type == 'dir':
+        source_files = os.listdir(source)
+        for subfile in source_files:
+            sub_source = os.path.join(source, subfile)
+            sub_dest = os.path.join(dest, subfile)
+            if not move_merge(sub_source, sub_dest, clobber, dry_run):
+                return False
+        return True
+    elif source_type == "dir" and dest_type == "file":
+        echo("Trying to copy a directory over an existing file!\n"
+             "{} is a directory\n"
+             "{} is a regular file", source, dest)
+        return False
+    elif source_type == "file" and dest_type == "dir":
+        echo("Trying to copy a file over an existing directory!\n"
+             "{} is a regular file\n"
+             "{} is a directory", source, dest)
+        return False
+    elif source_type == "file" and dest_type == "file" and not clobber:
+        echo("Trying to write a file over another one!\n"
+             "{} would be overwritten\n"
+             "pass the --clobber option if you really want to do this")
+        return False
+    elif dest_type == "non-existent":
+        if dry_run:
+            echo("Would move ./{} -> ./{}", source, dest)
+        elif VERBOSE:
+            echo("Moving ./{} -> ./{}", source, dest)
+        if not dry_run:
+            os.renames(source, dest)
+    else:
+        assert False, "This shouldn't happen!"
+    return True
+
+
+def path_type(path):
+    if os.path.isdir(path):
+        return 'dir'
+    elif os.path.isfile(path):
+        return 'file'
+    else:
+        return 'non-existent'
+
+
+def both_paths(branch_path, cwd, filename):
+    '''Given the branch path and current working directory, will
+    return the project path for a file, and the bromine path for a
+    file'''
+    project_path = os.path.relpath(os.path.join(PROJECT_DIR, filename), cwd)
+    bromine_path = os.path.join(os.path.relpath(branch_path, cwd), filename)
+    return project_path, bromine_path
 
 
 def dir_size(path):
     '''Returns a human readable string of the total size of a directory'''
     du_output = subprocess.check_output(
         ['du', '--summarize', '--human-readable', path])
-    return re.search(r'^(\w+)\t', du_output).groups()[0]
+    return re.search(r'^([\w.]+)\t', du_output).groups()[0]
 
 def branch_dir(branchname):
     '''Returns the branch directory name for the given branch'''
@@ -201,7 +278,7 @@ def delete(branch, force):
         echo("{} is not currently tracked by bromine.", branch)
         return
     size = dir_size(branch_path)
-    click.confirm("Are you sure you want to delete all bromine data for {}?\n"
+    click.confirm("Are you sure you want to delete all stashed files for {}?\n"
                   "It currently has a size of {}".format(branch, size))
 
 def get_current_branch():
