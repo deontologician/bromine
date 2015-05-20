@@ -5,6 +5,7 @@ import ConfigParser as configparser
 import shutil
 import os.path
 import os
+import stat
 import sys
 import re
 import functools
@@ -119,13 +120,18 @@ def main(verbose):
 
 
 @main.command()
-def switch():
-    depart, arrive = get_last_checkout(PROJECT_DIR)
-    echo("From {} to {}", depart, arrive)
-    git_ancestry = git_ancestor_compare(depart, arrive)
-    echo("{} is {} to {} in git", depart, git_ancestry, arrive)
-    semantic_ancestry = semantic_ancestor_compare(depart, arrive)
-    echo("{} is {} to {} semantically", depart, semantic_ancestry, arrive)
+@click.argument("branch")
+@click.pass_context
+def switch(ctx, branch):
+    ctx.invoke(stop)
+    ctx.invoke(stash)
+    if subprocess.call(['git', 'checkout', branch], cwd=PROJECT_DIR) != 0:
+        echo("Switching branches failed. Unstashing branch real quick...")
+        ctx.invoke(unstash)  # put stashed files back where we found them
+        exit(1)
+    ctx.invoke(unstash, name=branch)
+    ctx.invoke(start)
+
 
 @main.command()
 @click.option('--name', default=INVALID_NAME, help="Name to stash under")
@@ -214,7 +220,7 @@ def move_merge(source, dest, clobber=False, dry_run=False):
     elif source_type == "file" and dest_type == "file" and not clobber:
         echo("Trying to write a file over another one!\n"
              "{} would be overwritten\n"
-             "pass the --clobber option if you really want to do this")
+             "pass the --clobber option if you really want to do this", dest)
         return False
     elif dest_type == "non-existent":
         if dry_run:
@@ -223,18 +229,30 @@ def move_merge(source, dest, clobber=False, dry_run=False):
             echo("Moving ./{} -> ./{}", source, dest)
         if not dry_run:
             os.renames(source, dest)
+    elif source_type in {'socket', 'fifo', 'mount', 'other'}:
+        trace("Skipping {} since it is a {}", source, source_type)
+        trace("(Bromine doesn't move anything "
+              "but regular files and directories)")
     else:
         assert False, "This shouldn't happen!"
     return True
 
 
 def path_type(path):
-    if os.path.isdir(path):
+    if not os.path.exists(path):
+        return 'non-existent'
+    elif os.path.isdir(path):
         return 'dir'
     elif os.path.isfile(path):
         return 'file'
+    elif os.path.ismount(path):
+        return "mount"
+    elif stat.S_ISSOCK(os.stat(path).st_mode):
+        return "socket"
+    elif stat.S_ISFIFO(os.stat(path).st_mode):
+        return "fifo"
     else:
-        return 'non-existent'
+        return 'other'
 
 
 def both_paths(branch_path, cwd, filename):
@@ -286,25 +304,48 @@ def server():
     '''Server commands'''
 
 @server.command()
-def start():
+@click.option('--dry-run', '-d', is_flag=True, help="Don't start the server")
+def start(dry_run):
     '''Start the server'''
-    echo("Starting the server...")
+    if dry_run:
+        echo("Would start the server")
+    else:
+        echo("Starting the server...")
     trace("executing {}", O.start_cmd)
-    subprocess.call(O.start_cmd, shell=True)
+    if not dry_run:
+        return subprocess.call(O.start_cmd, shell=True)
 
 @server.command()
-def stop():
+@click.option('--dry-run', '-d', is_flag=True, help="Don't stop the server")
+def stop(dry_run):
     '''Stop the server'''
-    echo("Stopping the server...")
+    if dry_run:
+        echo("Would stop the server.")
+    else:
+        echo("Stopping the server...")
     trace("executing {}", O.stop_cmd)
-    subprocess.call(O.stop_cmd, shell=True)
+    if not dry_run:
+        return subprocess.call(O.stop_cmd, shell=True)
 
 @server.command()
-def restart():
+@click.option('--dry-run', '-d', is_flag=True, help="Don't restart the server")
+@click.pass_context
+def restart(ctx, dry_run):
     '''Restart the server'''
-    echo("Restarting the server...")
+    if dry_run:
+        echo("Would restart the server.")
+    else:
+        echo("Restarting the server...")
+
     trace("executing {}", O.restart_cmd)
-    subprocess.call(O.restart_cmd, shell=True)
+    if not dry_run:
+        if not O.restart_cmd:
+            stop_result = ctx.invoke(stop, dry_run=dry_run)
+            start_result = ctx.invoke(start, dry_run=dry_run)
+            return start_result + stop_result
+        else:
+            return subprocess.call(O.restart_cmd, shell=True)
+
 
 def get_current_branch():
     '''Finds the current git branch in the project directory'''
