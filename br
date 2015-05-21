@@ -6,9 +6,10 @@ import shutil
 import os.path
 import os
 import stat
-import sys
 import re
 import functools
+import errno
+import shutil
 
 import click
 
@@ -19,16 +20,45 @@ BRANCHES_DIR = None
 
 
 VERBOSE = False
+DRY_RUN = False
 
 INVALID_NAME = type('Invalid', (object,), {})()
+
+
+def echo(fmt, *args, **kwargs):
+    click.echo(fmt.format(*args, **kwargs), **kwargs)
+
 
 def trace(fmt, *args, **kwargs):
     '''Simplifies echoing only on the verbose flag'''
     if VERBOSE:
-        click.echo(fmt.format(*args, **kwargs), **kwargs)
+        echo(fmt, *args, **kwargs)
+    elif DRY_RUN:
+        echo("Would be " + fmt, *args, **kwargs)
 
-def echo(fmt, *args, **kwargs):
-    click.echo(fmt.format(*args, **kwargs), **kwargs)
+def move(source, dest):
+    '''Moves a file, skipping it if DRY_RUN active'''
+    trace("Moving {} -> {}", source, dest)
+    if not DRY_RUN:
+        dest_dir = os.path.dirname(dest)
+        if not os.path.exists(dest_dir):
+            trace("Making parent dir {}", dest_dir)
+            os.makedirs(dest_dir)
+            shutil.copystat(os.path.dirname(source), dest_dir)
+        shutil.move(source, dest)
+
+def destructive_subcall(*args, **kwargs):
+    '''Used for subprocess calls that may cause changes'''
+    if not DRY_RUN:
+        return subprocess.call(*args, **kwargs)
+    else:
+        return subprocess.call('true', **kwargs)
+
+def rmdir(dirname):
+    '''Delete a directory unless dry running'''
+    if not DRY_RUN:
+        return os.rmdir(dirname)
+
 
 class Options(object):
     def __init__(self):
@@ -112,34 +142,38 @@ def load_config():
 
 @click.group()
 @click.option('--verbose', '-v', is_flag=True, default=False, help='Verbose output')
-def main(verbose):
+@click.option('--dry-run', '-d', is_flag=True, default=False,
+              help="Don't do anything, just report what would be done")
+def main(verbose, dry_run):
     '''Manage non-source code materials when switching branches'''
-    global VERBOSE
-    VERBOSE = verbose
+    global VERBOSE, DRY_RUN
+    VERBOSE, DRY_RUN = verbose, dry_run
     load_config()
 
 
 @main.command()
 @click.argument("branch")
+@click.option('--ignore-server', '-i', is_flag=True,
+              help="Don't turn the server on or off when switching")
 @click.pass_context
-def switch(ctx, branch):
-    ctx.invoke(stop)
+def switch(ctx, branch, ignore_server):
+    if not ignore_server:
+        ctx.invoke(stop)
     ctx.invoke(stash)
     if subprocess.call(['git', 'checkout', branch], cwd=PROJECT_DIR) != 0:
         echo("Switching branches failed. Unstashing branch real quick...")
         ctx.invoke(unstash)  # put stashed files back where we found them
         exit(1)
     ctx.invoke(unstash, name=branch)
-    ctx.invoke(start)
+    if not ignore_server:
+        ctx.invoke(start)
 
 
 @main.command()
 @click.option('--name', default=INVALID_NAME, help="Name to stash under")
-@click.option('--dry-run', '-d', is_flag=True,
-              help="Don't do anything, just report what would be done")
 @click.option('--clobber', is_flag=True,
               help="Overwrite existing stashed files")
-def stash(name, dry_run, clobber):
+def stash(name, clobber):
     '''Move git untracked files into bromine storage'''
     if name is INVALID_NAME:
         name = get_current_branch()
@@ -151,34 +185,40 @@ def stash(name, dry_run, clobber):
         # todo: prompt if they want to override it
         pass
 
+    to_move = (both_paths(branch_path, current_dir, f)
+               for f in clean_report(PROJECT_DIR))
+
+    moved_anything = False
+    for project_file, bromine_file in to_move:
+        moved_anything = True
+        if not move_merge(project_file, bromine_file, clobber):
+            exit(1)
+
+    if not moved_anything:
+        echo("Nothing to stash for branch {}", name)
+        return
+
+
+def clean_report(directory):
     removable = re.compile(r'Would remove (.*)')
-    git_clean_report = subprocess.Popen(
+    git_clean = subprocess.Popen(
         ['git', 'clean', '--dry-run', '-x', '-d'],
-        cwd=PROJECT_DIR,
+        cwd=directory,
         stdout=subprocess.PIPE,
     )
     current_dir = os.getcwd()
-    to_move = []
-    for line in git_clean_report.stdout.readlines():
+    for line in git_clean.stdout:
         filename = removable.search(line).groups()[0]
         if filename and filename != '.bromine/':
-            to_move.append(both_paths(branch_path, current_dir, filename.rstrip('/')))
-    if not to_move:
-        echo("Nothing to stash for branch {}", name)
-        return
-    for project_file, bromine_file in to_move:
-        if not move_merge(project_file, bromine_file, clobber, dry_run):
-            exit(1)
+            yield filename.rstrip('/')
+
 
 @main.command()
 @click.argument('name', default=INVALID_NAME)
-@click.option('--dry-run', '-d', is_flag=True,
-              help="Don't actually unstash anything, "
-              "just report what would have been done")
 @click.option('--clobber', is_flag=True,
               help="Clobber existing files in the project directory "
               "when unstashing")
-def unstash(name, dry_run, clobber):
+def unstash(name, clobber):
     '''Move stashed files back to the project dir'''
     if name is INVALID_NAME:
         name = get_current_branch()
@@ -190,10 +230,10 @@ def unstash(name, dry_run, clobber):
     get_paths = functools.partial(both_paths, branch_path, os.getcwd())
     to_replace = [get_paths(filename) for filename in os.listdir(branch_path)]
     for project_file, bromine_file in to_replace:
-        if not move_merge(bromine_file, project_file, clobber, dry_run):
+        if not move_merge(bromine_file, project_file, clobber):
             exit(1)
 
-def move_merge(source, dest, clobber=False, dry_run=False):
+def move_merge(source, dest, clobber=False):
     '''Moves a list of files to their destination. The filenames need
     to be in either absolute format or relative to the current working
     directory because this method calls os.listdir recursively if
@@ -204,7 +244,7 @@ def move_merge(source, dest, clobber=False, dry_run=False):
         for subfile in source_files:
             sub_source = os.path.join(source, subfile)
             sub_dest = os.path.join(dest, subfile)
-            if not move_merge(sub_source, sub_dest, clobber, dry_run):
+            if not move_merge(sub_source, sub_dest, clobber):
                 return False
         return True
     elif source_type == "dir" and dest_type == "file":
@@ -217,18 +257,14 @@ def move_merge(source, dest, clobber=False, dry_run=False):
              "{} is a regular file\n"
              "{} is a directory", source, dest)
         return False
-    elif source_type == "file" and dest_type == "file" and not clobber:
+    elif source_type == "file" and dest_type != "non-existent" and not clobber:
         echo("Trying to write a file over another one!\n"
              "{} would be overwritten\n"
              "pass the --clobber option if you really want to do this", dest)
         return False
     elif dest_type == "non-existent":
-        if dry_run:
-            echo("Would move ./{} -> ./{}", source, dest)
-        elif VERBOSE:
-            echo("Moving ./{} -> ./{}", source, dest)
-        if not dry_run:
-            os.renames(source, dest)
+        trace("Moving ./{} -> ./{}", source, dest)
+        move(source, dest)
     elif source_type in {'socket', 'fifo', 'mount', 'other'}:
         trace("Skipping {} since it is a {}", source, source_type)
         trace("(Bromine doesn't move anything "
@@ -245,12 +281,6 @@ def path_type(path):
         return 'dir'
     elif os.path.isfile(path):
         return 'file'
-    elif os.path.ismount(path):
-        return "mount"
-    elif stat.S_ISSOCK(os.stat(path).st_mode):
-        return "socket"
-    elif stat.S_ISFIFO(os.stat(path).st_mode):
-        return "fifo"
     else:
         return 'other'
 
@@ -259,8 +289,9 @@ def both_paths(branch_path, cwd, filename):
     '''Given the branch path and current working directory, will
     return the project path for a file, and the bromine path for a
     file'''
-    project_path = os.path.relpath(os.path.join(PROJECT_DIR, filename), cwd)
-    bromine_path = os.path.join(os.path.relpath(branch_path, cwd), filename)
+    from os.path import normpath, relpath, join
+    project_path = normpath(relpath(join(PROJECT_DIR, filename), cwd))
+    bromine_path = normpath(join(relpath(branch_path, cwd), filename))
     return project_path, bromine_path
 
 
@@ -304,47 +335,77 @@ def server():
     '''Server commands'''
 
 @server.command()
-@click.option('--dry-run', '-d', is_flag=True, help="Don't start the server")
-def start(dry_run):
+def start():
     '''Start the server'''
-    if dry_run:
-        echo("Would start the server")
-    else:
-        echo("Starting the server...")
+    trace("Starting the server...")
     trace("executing {}", O.start_cmd)
-    if not dry_run:
-        return subprocess.call(O.start_cmd, shell=True)
+    destructive_subcall(O.start_cmd, shell=True)
 
 @server.command()
-@click.option('--dry-run', '-d', is_flag=True, help="Don't stop the server")
-def stop(dry_run):
+def stop():
     '''Stop the server'''
-    if dry_run:
-        echo("Would stop the server.")
-    else:
-        echo("Stopping the server...")
+    trace("Stopping the server...")
     trace("executing {}", O.stop_cmd)
-    if not dry_run:
-        return subprocess.call(O.stop_cmd, shell=True)
+    return destructive_subcall(O.stop_cmd, shell=True)
 
 @server.command()
-@click.option('--dry-run', '-d', is_flag=True, help="Don't restart the server")
 @click.pass_context
-def restart(ctx, dry_run):
+def restart(ctx):
     '''Restart the server'''
-    if dry_run:
-        echo("Would restart the server.")
-    else:
-        echo("Restarting the server...")
-
+    trace("Restarting the server...")
     trace("executing {}", O.restart_cmd)
-    if not dry_run:
-        if not O.restart_cmd:
-            stop_result = ctx.invoke(stop, dry_run=dry_run)
-            start_result = ctx.invoke(start, dry_run=dry_run)
-            return start_result + stop_result
+    if not O.restart_cmd:
+        stop_result = ctx.invoke(stop)
+        start_result = ctx.invoke(start)
+        return start_result + stop_result
+    else:
+        return destructive_subcall(O.restart_cmd, shell=True)
+
+
+@main.command()
+def walk():
+    global DRY_RUN
+    DRY_RUN = False
+    behavior = 'stash'
+    cwd = os.getcwd()
+    branch_path = branch_dir(get_current_branch())
+    if behavior == 'stash':
+        for path in clean_report(PROJECT_DIR):
+            source, dest = both_paths(branch_path, cwd, path)
+            ptype = path_type(path)
+            if ptype in ('file', 'dir'):
+                move(source, dest)
+            else:
+                echo("Skipping {} because it isn't a file or directory", path)
+    else:
+        proj_dir, br_dir = both_parts(branch_path, cwd, '.')
+        move(br_dir, proj_dir)
+
+def _move_merge(source, dest):
+    from os.path import join, exists, relpath
+    for source_path, dirnames, filenames in os.walk(source):
+        dest_path = join(dest, relpath(source_path, source))
+        if not os.path.exists(dest_path):
+            pass
+            # echo("Creating dir {}", dest_path)
         else:
-            return subprocess.call(O.restart_cmd, shell=True)
+            trace("{} already exists", dest_path)
+        # trace("Moving {} files in {}", len(filenames), source_path)
+        for filename in filenames:
+            dest_file = join(dest_path, filename)
+            source_file = join(source_path, filename)
+            if exists(dest_file):
+                echo("Aborting: File already exists: {}", dest_file)
+                return False
+            elif path_type(source_file) != "file":
+                trace("Skipping non file {}", source_file)
+            else:
+                move(source_file, dest_file)
+        try:
+            rmdir(source_path)
+        except OSError as e:
+            if e.errno != errno.ENOTEMPTY:
+                raise
 
 
 def get_current_branch():
@@ -376,6 +437,7 @@ def get_last_checkout(project_dir):
         echo("Could not find a checkout line in the reflog!", err=True)
         exit(1)
 
+
 def git_ancestor_compare(A, B):
     '''Determines if the the departure branch is a descendent of the
     arrival branch.'''
@@ -392,6 +454,7 @@ def git_ancestor_compare(A, B):
     else:
         return "incomparable"
 
+
 def semantic_ancestor_compare(A, B):
     '''Semantic ancestry is based on version comparison.'''
     version_re = re.compile(r'v(\d+).(\d+).(\d+|x)')
@@ -401,13 +464,13 @@ def semantic_ancestor_compare(A, B):
         return "incomparable"
     major_a, minor_a, patch_a = search_a.groups()
     major_b, minor_b, patch_b = search_b.groups()
-    if major_a < major_b:
+    if int(major_a) < int(major_b):
         return "ancestor"
-    elif major_a > major_b:
+    elif int(major_a) > int(major_b):
         return "descendent"
-    elif minor_a < minor_b:
+    elif int(minor_a) < int(minor_b):
         return "ancestor"
-    elif minor_a > minor_b:
+    elif int(minor_a) > int(minor_b):
         return "descendent"
     elif 'x' in (patch_a, patch_b):
         return "ancestor"
@@ -418,15 +481,13 @@ def semantic_ancestor_compare(A, B):
 
 if __name__ == '__main__':
     '''Commands I'd like:
-    br new (create a new config for a branch)
+    br new (create a new branch)
       - have the option to link it to a github issue
       - have the option to create it from an existing project
-    br tree
+    br list
     br delete (delete a bromine config for a branch)
     br close (like delete but just archives it, closing the github issue associated)
     br switch (switch configurations, branches, build and reboot the server)
-    br unhook (unstow all files)
-    br sync (sync up bromine with the current git branch)
     br server reboot (restart the server for a branch)
     br server stop (stop the server)
     br server start (start the server)
